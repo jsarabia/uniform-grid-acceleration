@@ -1,0 +1,518 @@
+<html>
+	<head>
+		<title>CAP 6721 Joseph Sarabia</title>
+		<script type="text/javascript" src="main.js"></script>
+ 		<script type="text/javascript" src="gl-matrix.js"></script>
+ 		<script type="text/javascript" src="scene1.js"></script>
+	</head>
+	<body onLoad="main()">
+		<script id="raytrace" type="text/x-opencl">
+
+			typedef struct ray_struct{
+				float3 origin;
+				float3 direction;
+				float tmin;
+				float tmax;
+			} Ray;
+
+			typedef struct intersect_struct{
+				int i;
+				float t;
+				float a; 
+				float b;
+				float c;
+			} intersection;
+
+			typedef struct aabb_intersect_struct{
+				float tmin;
+				float tmax;
+			} aabb_intersect;
+
+			int ray_inside_box(Ray ray, float3 aabb_min, float3 aabb_max){
+				if(aabb_min.x <= ray.origin.x && ray.origin.x <= aabb_max.x){
+					if(aabb_min.y <= ray.origin.y && ray.origin.y <= aabb_max.y)
+						if(aabb_min.z <= ray.origin.z && ray.origin.z <= aabb_max.z)
+							return 1;
+				} return 0;
+				//return 0;
+			}
+
+			aabb_intersect ray_aabb_intersect(float3 aabb_min, float3 aabb_max, Ray ray){
+				float txmin, tymin, tzmin, txmax, tymax, tzmax, tnear, tfar;
+
+				aabb_intersect t;
+
+				txmin = (aabb_min.x-ray.origin.x)/(ray.direction.x);
+				tymin = (aabb_min.y-ray.origin.y)/(ray.direction.y);
+				tzmin = (aabb_min.z-ray.origin.z)/(ray.direction.z);
+
+				txmax = (aabb_max.x-ray.origin.x)/(ray.direction.x);
+				tymax = (aabb_max.y-ray.origin.y)/(ray.direction.y);
+				tzmax = (aabb_max.z-ray.origin.z)/(ray.direction.z);
+
+				float temp;
+				if(txmin > txmax){
+					temp = txmin;
+					txmin = txmax;
+					txmax = temp;
+				}
+				if(tymin > tymax){
+					temp = tymin;
+					tymin = tymax;
+					tymax = temp;
+				}
+				if(tzmin > tzmax){
+					temp = tzmin;
+					tzmin = tzmax;
+					tzmax = temp;
+				}
+
+				tfar = min(min(txmax,tymax), tzmax);
+				tnear = max(max(txmin,tymin), tzmin);
+
+				//aabb_intersect t;
+				t.tmin = INFINITY;
+				t.tmax = -INFINITY;
+				if(tnear < tfar){
+					t.tmin = tnear;
+					t.tmax = tfar;
+				}
+				return t;
+			}
+
+
+			
+			int shadowRay(float3 point, float3 light, int nTriangles, __global const float *triangleData){
+
+				Ray ray;
+				ray.origin = point;
+				ray.direction = light-point;
+				float t=-1;
+
+				for (int i = 0; i< nTriangles; i++){
+					float3 p0 = (float3)(triangleData[(19*i)+0],triangleData[(19*i)+1],triangleData[(19*i)+2]);
+					float3 p1 = (float3)(triangleData[(19*i)+3],triangleData[(19*i)+4],triangleData[(19*i)+5]);
+					float3 p2 = (float3)(triangleData[(19*i)+6],triangleData[(19*i)+7],triangleData[(19*i)+8]);
+
+					float3 p2p0 = (float3)(p2-p0);
+					float3 p1p0 = (float3)(p1-p0);
+
+					float3 normal = cross(p1p0, p2p0);
+					if(dot(normal, ray.direction) != 0.){
+						t = dot(normal, p0 - ray.origin) / dot(normal, ray.direction);
+						if(t > 0.){
+							float3 point = ray.origin + (t * ray.direction);
+							float a = dot(cross(point - p0, p2p0), normal)/(dot(normal,normal));
+							if(a > 0.00001){
+								float b = dot(cross(p1p0, point-p0), normal)/(dot(normal,normal));
+									if(b >=0. && a+b <= 1.){
+										
+										if(t <= 1. && t > .001){
+											return 0;
+										}
+										
+									}
+							}
+						}
+					}
+				}
+
+				return 1;
+			}
+
+			Ray reflectionRay(float3 normal, Ray ray, float3 point){
+				Ray newRay;
+
+				normal = normalize(normal);
+				ray.direction = normalize(ray.direction);
+
+				newRay.origin = point;
+				newRay.direction = ray.direction - ((float)2 * normal * dot(normal, ray.direction));
+
+				return newRay;
+			}
+
+			intersection ray_triangle_intersect(Ray ray, float3 p0, float3 p1, float3 p2, int i){
+				float t = INFINITY;
+				intersection tmin;
+				tmin.t = INFINITY;
+				tmin.i = -1;
+				
+
+				float3 p2p0 = (float3)(p2-p0);
+				float3 p1p0 = (float3)(p1-p0);
+
+				float3 normal = cross(p1p0, p2p0);
+				if(dot(normal, ray.direction) != 0.){
+					t = dot(normal, p0 - ray.origin) / dot(normal, ray.direction);
+					if(t > 0.00001){
+						float3 point = ray.origin + (t * ray.direction);
+						float a = dot(cross(point - p0, p2p0), normal)/(dot(normal,normal));
+						if(a > 0.){
+							float b = dot(cross(p1p0, point-p0), normal)/(dot(normal,normal));
+								if(b >=0. && a+b <= 1.){
+								
+									if(tmin.t > t){
+										tmin.t = t;
+										tmin.i = i;
+										tmin.a = a;
+										tmin.b = b;
+										tmin.c = 1 - a -b;
+									}
+									
+								}
+						}
+					}
+				}
+					
+
+				
+
+				return tmin;
+			}
+
+			float3 rayPoint(Ray ray, float t){
+				return  (ray.origin + (t * ray.direction));
+			}
+
+			int gridIndex(int3 ijk, int resolution){
+				int index = 0;
+				for(int x = 0; x < resolution; x++)
+					for (int y = 0; y < resolution; y++)
+						for (int z = 0; z < resolution; z++){
+							if(ijk.x == x && y == ijk.y && z == ijk.z)
+								return index;
+							index++;
+						}
+
+				return 0;
+
+				//return (ijk.x*resolution)+(ijk.y*resolution)+ijk.z;
+			}
+
+			int3 pointToIJK(__global const float *aabb, int resolution, float3 point){
+				int3 ijk = (int3)(-1,-1,-1);
+				//get the cell dimensions, since the aabb is a cube, they will all be the same
+				float dx = (aabb[3]-aabb[0])/(float)resolution;
+				float pos = aabb[0]+0;
+
+				//find where the point lies inside the grid
+				//large resolutions seem to need <= resolution, but that's wrong
+				for(int x = 0; x <= resolution; x++){
+					if(point.x >= (pos-.00001) && point.x <= (pos+dx)+.00001){
+						ijk.x = x;
+						break;
+					}
+					pos += dx;
+				}
+				pos = aabb[1];
+				for(int x = 0; x <= resolution; x++){
+					if(point.y > (pos-.00001) && point.y <= (pos+dx)+.00001){
+						ijk.y = x;
+						break;
+					}
+					pos += dx;
+				}
+				pos = aabb[2];
+				for(int x = 0; x <= resolution; x++){
+					if(point.z >= (pos-.00001) && point.z <= (pos+dx)+.00001){
+						ijk.z = x;
+						break;
+					}
+					pos += dx;
+				}
+
+				//ijk.x-=1;ijk.y-=1;ijk.z-=1;
+				return ijk;
+			}
+
+			intersection getRayIntersection(Ray ray, int cindex, int stopindex, __global const int *cellBuffer, __global const float *triangleData, int nTriangles){
+				intersection t;
+				t.t = INFINITY;
+				t.i = -1;
+				
+				//loop through triangle data by the indexes given through the cell buffer
+				for (int i = cindex; i < stopindex; i++){
+						int j = (cellBuffer[i]);
+				//for (int j = 0; j < nTriangles; j++){
+						//if the cell has no triangles, break
+						if(j == -1)
+							break;
+						float3 p0 = (float3)(triangleData[(19*j)+0],triangleData[(19*j)+1],triangleData[(19*j)+2]);
+						float3 p1 = (float3)(triangleData[(19*j)+3],triangleData[(19*j)+4],triangleData[(19*j)+5]);
+						float3 p2 = (float3)(triangleData[(19*j)+6],triangleData[(19*j)+7],triangleData[(19*j)+8]);
+						intersection ttemp = ray_triangle_intersect(ray, p0, p1, p2, j);
+						if(ttemp.t < t.t && ttemp.t > 0.0001){
+							t = ttemp;
+						}
+				}
+
+				return t;
+			}
+
+			intersection traverseGrid(Ray ray, __global const float *aabb, int resolution, __global const int *cellBuffer, 
+				__global const int *cellIndex, int cellBufferLength, int nCells, __global const float *triangleData, int nTriangles){
+				float3 normdir = (ray.direction);
+
+				int di = (ray.direction.x >= (float)0.)?1:(-1);
+				float dx = fabs((aabb[3]-aabb[0])/resolution);
+				float dtx = fabs(dx/fabs(normdir.x));
+				int OORx = (ray.direction.x >= (float)0.)?resolution:(-1);
+
+				int dj = (ray.direction.y >= (float)0.)?1:(-1);
+				float dy = fabs((aabb[4]-aabb[1])/resolution);
+				float dty = fabs(dy/fabs(normdir.y));
+				int OORy = (ray.direction.y >= (float)0.)?resolution:(-1);
+
+				int dk = (ray.direction.z >= (float)0.)?1:(-1);
+				float dz = fabs((aabb[5]-aabb[2])/resolution);
+				float dtz = fabs(dz/fabs(normdir.z));
+				int OORz = (ray.direction.z >= (float)0.)?resolution:(-1);
+
+				//primary ray should always intersect the bounding box or it wont get to this point in code
+				//pintersect is tmin if the ray is outside, origin if inside
+				float3 pintersect;
+				if(ray_inside_box(ray, (float3)(aabb[0],aabb[1], aabb[2]), (float3)(aabb[3],aabb[4], aabb[5])) == 1) 
+					pintersect = ray.origin;			
+				else 
+					pintersect = rayPoint(ray, ray.tmin);//pintersect = rayPoint(ray, max(ray.tmin, (float)0));
+				
+				int3 gridijk = pointToIJK(aabb, resolution, pintersect);
+				
+				intersection t;
+				t.t = INFINITY;
+				t.i = -1;
+
+				float xNext;
+				float yNext;
+				float zNext;
+				if(di > 0)
+					xNext = aabb[0] + (dx * (gridijk.x+1));
+				else
+				 	xNext = aabb[3] - (dx * (resolution-gridijk.x));
+				if(dj > 0)
+					yNext = aabb[1] + (dy * (gridijk.y+1));
+				else
+				 	yNext = aabb[4] - (dy * (resolution-gridijk.y));
+				if(dk > 0)
+					zNext = aabb[2] + (dz * (gridijk.z+1));
+				else
+				 	zNext = aabb[5] - (dz * (resolution-gridijk.z));
+
+				float txn = fabs(xNext-pintersect.x)/fabs(ray.direction.x);
+				float tyn = fabs(yNext-pintersect.y)/fabs(ray.direction.y);
+				float tzn = fabs(zNext-pintersect.z)/fabs(ray.direction.z);
+
+				while(t.t == INFINITY){
+	
+					if (gridijk.x == -1 || gridijk.x == resolution || gridijk.y == -1  || gridijk.y == resolution || gridijk.z == -1 || gridijk.z == resolution){
+						//color = (float3)(1,1,1);
+						break;
+					}
+
+					int gindex = gridIndex(gridijk, resolution);
+					int cindex;
+
+					if(gindex >= 0 && gindex < nCells)
+						cindex = cellIndex[gindex];
+					else 
+						cindex = cellBufferLength;
+				
+
+					//if gindex refers to the last element in the cellindex array, then the stop index is the end of the cellbuffer
+					int stopindex;
+					if((gindex+1) < nCells)
+						 stopindex = cellIndex[gindex+1];
+					else 
+						stopindex = cellBufferLength;
+
+
+					intersection ttemp = getRayIntersection(ray, cindex, stopindex, cellBuffer, triangleData, nTriangles);
+
+				 	//if ttemp holds an intersection, then break
+					if(ttemp.t < INFINITY){
+					 	t = ttemp;
+					 	//color = (float3)(1,1,1);
+					 	break;
+					}
+
+					//otherwise work on getting the next intersection
+					//update t to find next cell
+					if (txn <= tyn && txn <= tzn){
+							gridijk.x += di;
+							
+							txn += dtx;
+						} else if (tyn <= tzn && tyn <= txn){
+							gridijk.y += dj;
+							
+							tyn += dty;
+						} else {
+							gridijk.z += dk;
+							
+							tzn += dtz;
+					}		
+				}
+				return t;
+			}
+
+			float3 getColor(Ray ray, 
+				__global const float *triangleData,
+				int nTriangles,
+				int nMaterials,
+				__global const float *materialData,
+				__global const int *cellBuffer,
+				__global const int *cellIndex, 
+				int cellBufferLength,
+				int nCells,
+				__global const float *aabb, 
+				int resolution,
+				int scene		
+				)
+			{
+
+				float3 color = (float3)(0,0,0);
+				float3 attenuation = (float3)(1,1,1);
+				//float3 light = (float3)(0,1.9,0);
+				float3 light;
+				if(scene == 0)
+					light = (float3)(0,1.9,0);
+				else 
+					light = ray.origin;
+
+				//intersection traverseGrid(Ray ray, __global const float *aabb, int resolution, __global const int *cellBuffer, __global const int *cellIndex, int cellBufferLength, int nCells,){
+				intersection t = traverseGrid(ray, aabb, resolution, cellBuffer, cellIndex, cellBufferLength, nCells, triangleData, nTriangles);
+			
+				for(int i = 0; i < 3; i++){
+					if(i > 0){
+						t.t = INFINITY;
+						t.i = -1;
+					}
+					intersection ttemp;
+
+					if(i>0)
+						t = traverseGrid(ray, aabb, resolution, cellBuffer, cellIndex, cellBufferLength, nCells, triangleData, nTriangles);
+					
+					if(t.t < INFINITY){
+						float3 point = ray.origin + (t.t * ray.direction);
+						float3 normal;
+						
+
+							float3 p0 = (float3)(triangleData[(19*t.i)+0],triangleData[(19*t.i)+1],triangleData[(19*t.i)+2]);
+							float3 p1 = (float3)(triangleData[(19*t.i)+3],triangleData[(19*t.i)+4],triangleData[(19*t.i)+5]);
+							float3 p2 = (float3)(triangleData[(19*t.i)+6],triangleData[(19*t.i)+7],triangleData[(19*t.i)+8]);
+
+							float3 p2p = (float3)(p2-point);
+							float3 p1p = (float3)(p1-point);
+
+							normal = cross(p1p, p2p);
+							int matIndex = triangleData[(19*t.i)+18];
+							int notShadow = shadowRay(point, light, nTriangles, triangleData);
+							//notShadow = 1;
+							if(notShadow == 1){							
+
+								float3 n0 = (float3)(triangleData[(19*t.i)+9],triangleData[(19*t.i)+10],triangleData[(19*t.i)+11]);
+								float3 n1 = (float3)(triangleData[(19*t.i)+12],triangleData[(19*t.i)+13],triangleData[(19*t.i)+14]);
+								float3 n2 = (float3)(triangleData[(19*t.i)+15],triangleData[(19*t.i)+16],triangleData[(19*t.i)+17]);
+								float3 interpolatedNormal = (float3)((t.a*n1)+(t.b*n2)+(t.c*n0));
+								
+								float3 kdiff = (float3)(materialData[(matIndex*6)],materialData[(matIndex*6)+1],materialData[(matIndex*6)+2]);
+							
+								float cosine = max(dot(normalize(light-point),interpolatedNormal),(float)0);
+								color += (float3)(attenuation.x*kdiff.x*cosine, attenuation.y*kdiff.y*cosine, attenuation.z*kdiff.z*cosine);
+							}
+							if((materialData[(matIndex*6)+3] > .0001) && (materialData[(matIndex*6)+4] > .0001) && (materialData[(matIndex*6)+5] > .0001)){
+								ray = reflectionRay(normal, ray, point);
+								ray.tmin = 0;
+								attenuation = (float3)(attenuation.x*materialData[(matIndex*6)+3], attenuation.y*materialData[(matIndex*6)+4], attenuation.z*materialData[(matIndex*6)+5]);
+							}	else break;	
+
+					} else break;
+				}
+				
+				return color;
+
+			}
+
+
+			__kernel void raytrace(
+				__global uchar4* pixels,
+				__global const float *camera,
+				__global const float *triangleData,
+				int nTriangles,
+				int rows, 
+				int cols,
+				int nMaterials,
+				__global const float *materialData,
+				__global const int *cellBuffer,
+				__global const int *cellIndex, 
+				int cellBufferLength,
+				int nCells,
+				__global const float *aabb, 
+				int resolution,
+				int scene			
+				) 
+			{
+
+				int col = get_global_id(0);
+				int row = get_global_id(1);
+				
+				if(col >= cols || row >= rows) return;
+
+				float3 w = normalize((float3)(camera[0]-camera[3], camera[1]-camera[4], camera[2]-camera[5]));
+				float3 u = normalize(cross((float3)(camera[6],camera[7],camera[8]),w));
+				float3 v = normalize(cross(w,u));
+
+				
+				float aspect = (float)cols/(float)(rows);
+				float height = 2.0 * tan(camera[9]/2.0);
+				float width = height * aspect;
+				float pixSize = height/(float)rows;
+
+				float part1f = (-.5 + (((float)col+.5)/cols)) * .75;
+				float3 part2 =  part1f * u;
+				float part2f = (.5 - (((float)row+.5)/rows)) * .75;
+				float3 part3 = part2f * v;
+				
+				float3 dir = -w + part2 + part3;
+
+				
+				Ray ray;
+				ray.direction = dir;
+				ray.origin = (float3)(camera[0], camera[1], camera[2]);
+
+				float3 color = (float3)(0,0,0);
+				float3 bounds_min = (float3)(aabb[0],aabb[1],aabb[2]);
+				float3 bounds_max = (float3)(aabb[3],aabb[4],aabb[5]);
+
+				
+
+				aabb_intersect aabb_t = ray_aabb_intersect(bounds_min, bounds_max, ray);
+				
+				if(aabb_t.tmin < INFINITY && aabb_t.tmax > -INFINITY){
+					ray.tmin = aabb_t.tmin;
+					ray.tmax = aabb_t.tmax;
+
+					color = getColor(ray, triangleData, nTriangles, nMaterials, materialData, cellBuffer, cellIndex, cellBufferLength, nCells, aabb, resolution, scene);
+					//color = (float3)(1,1,1);	
+				}//color = getColor(ray, triangleData, nTriangles, nMaterials, materialData);
+
+
+
+				pixels[row*cols+col] = (uchar4)(255*color.x,255*color.y,255*color.z,255);
+
+			}
+		</script>  
+		<div id="container" style = "width:1400px">
+			<div id="title" style ="background-color:#FFFFFF;height:75px;width:1300px;text-align:left;">
+				<h1>Joseph Sarabia Homework 5</h1>
+			</div>
+			<div id="window" style ="background-color:#FFFFFF;height:800px;width:850px;float:left;">
+				<canvas id="canvas" width="512px" height="512px" style="border:5px solid #000000; background: blue"></canvas><br> <button type="button" id="button" onclick="switchstuff()">Switch Scene</button>
+			</div>		
+			<div id="options" style="background-color:#FFFFFF;height:700px;width:515px;float:left;">			 
+			</div>
+
+		</div>
+		
+	</body>
+</html>
